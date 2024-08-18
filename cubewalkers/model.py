@@ -43,6 +43,7 @@ class Model:
         n_time_steps: int = 1,
         n_walkers: int = 1,
         probabilistic_lut: bool = False,
+        gpu_id: int = 0  # Add a parameter to specify the GPU ID
     ) -> None:
         """
         Parameters
@@ -88,6 +89,8 @@ class Model:
             treated as boolean, and the kernel is generated accordingly. By
             default `False`.
         """
+        self.gpu_id = gpu_id
+        cp.cuda.Device(self.gpu_id).use() # TODO: [SRI] Remove this line if not needed
         self.name = ""
         if model_name is None:
             g = None
