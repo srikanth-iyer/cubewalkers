@@ -191,6 +191,12 @@ class Model:
         """
 
         if self.n_walkers != self.initial_states.shape[1]:
+            warnings.warn(
+            "n_walkers (%d) does not match existing initial_states (%d); "
+            "reinitializing walkers to match n_walkers."
+            % (self.n_walkers, self.initial_states.shape[1]),
+            UserWarning,
+            )
             self.initialize_walkers()
 
         self.averages_only = averages_only
