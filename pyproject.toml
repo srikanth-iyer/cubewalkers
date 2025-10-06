@@ -3,13 +3,17 @@ name = "cubewalkers"
 authors = [{ name = "Jordan Rozum", email = "jrozum@binghamton.edu" }]
 version = "1.4.0"
 description = "Python package for simulating Boolean networks on the GPU"
-license = { file = "LISENSE" }
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest"]
 cana = ["cana"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [tool.mypy]
 mypy_path = ["stubs"]
