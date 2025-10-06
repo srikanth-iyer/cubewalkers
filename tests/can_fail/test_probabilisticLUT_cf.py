@@ -20,14 +20,14 @@ def test_probabilisticLUT():
         lookup_tables=prob_outs,
         node_regulators=prob_ins,
         n_time_steps=100,
-        n_walkers=4,
+        n_walkers=3,
         probabilistic_lut=True,
     )
     test_model = cw.Model(
         lookup_tables=outs,
         node_regulators=ins,
         n_time_steps=100,
-        n_walkers=4,
+        n_walkers=3,
         probabilistic_lut=False,
     )
     # lut_test_regulators = [[0], [0, 1], [2]]
