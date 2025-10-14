@@ -1,6 +1,5 @@
 import random
 from pathlib import Path
-import csv
 import seaborn as sns
 import pandas as pd
 from fitness import ca_network_from_output_list, compute_accuracy
@@ -80,7 +79,6 @@ def _summarize_array(
                             f"{name} stats: min={mn:.4g}, max={mx:.4g}, mean={mean:.4g}"
                         )
                 else:
-
                     if getattr(arr, "dtype", None) == np.bool_:
                         trues = int(arr.sum())
                         print(f"{name} stats: true_count={trues}")
@@ -191,6 +189,7 @@ def compute_minP0P1_auc_for_rules(
     n_time_steps: int | None = None,
     t_window: int = 2,
     rng_seed: int | None = None,
+    num_streams: int = 1,
 ) -> dict[str, float]:
     """Compute AUC(minP0P1) for multiple CA rules efficiently.
 
@@ -200,6 +199,7 @@ def compute_minP0P1_auc_for_rules(
     - Per-rule model reused across probabilities by swapping lookup_tables.
     - minP0P1 computed directly on-GPU from the last two timesteps (no compute_accuracy).
     - Optional single RNG seeding; shared initial states across rules for fair comparison.
+    - Configurable CUDA streams to overlap simulations across probabilities.
     """
 
     rules = list(rule_luts)
@@ -258,55 +258,75 @@ def compute_minP0P1_auc_for_rules(
     denom_above = cp.sum(start_above, axis=1)  # (R,)
     denom_below = cp.sum(start_below, axis=1)  # (R,)
 
-    # Create combined model; set initial states
-    # Use first probability to initialize lookup_tables; will swap each iteration
-    p0 = float(probs_cp[0].item()) if probs_cp.size > 0 else 0.0
-    lut0 = p0 + combined_outs * (1.0 - 2.0 * p0)
-    model = cw.Model(
-        lookup_tables=lut0,
-        node_regulators=combined_ins,
-        n_time_steps=n_time_steps,
-        n_walkers=n_walkers,
-        probabilistic_lut=True,
-    )
-    model.initial_states = init_all
+    if probs_cp.size == 0:
+        return {rule: float("nan") for rule in rules}
 
     deviations = 3.0
     P = int(probs_cp.shape[0])
+
+    # Limit streams to available work items to avoid idle streams
+    num_streams = min(int(num_streams), P, max(1, len(rules)))
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
+
+    # Allocate per-stream LUT buffers and models
+    p_init = float(probs_cp[0].item())
+    base_lut = p_init + combined_outs * (1.0 - 2.0 * p_init)
+    lut_buffers = [base_lut.copy() for _ in range(num_streams)]
+    models: list[cw.Model] = []
+    for idx in range(num_streams):
+        model = cw.Model(
+            lookup_tables=lut_buffers[idx],
+            node_regulators=combined_ins,
+            n_time_steps=n_time_steps,
+            n_walkers=n_walkers,
+            probabilistic_lut=True,
+        )
+        model.initial_states = init_all.copy()
+        models.append(model)
+
     # Store minP0P1 per probability per rule on device
     min_vals_all = cp.full((P, R), cp.nan, dtype=cp.float32)
 
     for i in range(P):
+        stream_idx = i % num_streams
+        stream = streams[stream_idx]
+        model = models[stream_idx]
+        lut_buf = lut_buffers[stream_idx]
         p_val = float(probs_cp[i].item())
-        # Swap LUT for current probability: p + outs*(1-2p)
-        model.lookup_tables = p_val + combined_outs * (1.0 - 2.0 * p_val)
 
-        model.simulate_ensemble(
-            maskfunction=cw.update_schemes.synchronous_PBN,
-            T_window=t_window,
-            averages_only=False,
-        )
-        if model.trajectories.shape[0] < 2:
-            continue
+        with stream:
+            # Update probabilistic LUT in-place for this stream
+            cp.multiply(combined_outs, (1.0 - 2.0 * p_val), out=lut_buf)
+            cp.add(lut_buf, p_val, out=lut_buf)
+            model.lookup_tables = lut_buf
+            # Refresh initial states to ensure deterministic runs per probability
+            model.initial_states = cp.copy(init_all)
+            model.simulate_ensemble(
+                maskfunction=cw.update_schemes.synchronous_PBN,
+                T_window=t_window,
+                averages_only=False,
+            )
+            traj = model.trajectories
+            if traj.shape[0] >= 2:
+                eps = (p_val * N + (p_val * (1.0 - p_val) * N) ** 0.5 * deviations) // 1
+                thr_hi = N - eps
+                thr_lo = eps
 
-        # Thresholds from epsilon
-        eps = (p_val * N + (p_val * (1.0 - p_val) * N) ** 0.5 * deviations) // 1
-        thr_hi = N - eps
-        thr_lo = eps
+                last2 = traj[-2:]
+                last2_rs = last2.reshape(2, R, N, n_walkers)
+                sums_last2 = cp.sum(last2_rs, axis=2)
+                end_above = (sums_last2[1] >= thr_hi) & (sums_last2[0] >= thr_hi)
+                end_below = (sums_last2[1] <= thr_lo) & (sums_last2[0] <= thr_lo)
 
-        last2 = model.trajectories[-2:]  # (2, R*N, W)
-        last2_rs = last2.reshape(2, R, N, n_walkers)
-        sums_last2 = cp.sum(last2_rs, axis=2)  # (2, R, W)
-        end_above = (sums_last2[1] >= thr_hi) & (sums_last2[0] >= thr_hi)
-        end_below = (sums_last2[1] <= thr_lo) & (sums_last2[0] <= thr_lo)
+                tp = cp.sum(start_above & end_above, axis=1).astype(cp.float32)
+                tn = cp.sum(start_below & end_below, axis=1).astype(cp.float32)
 
-        tp = cp.sum(start_above & end_above, axis=1).astype(cp.float32)  # (R,)
-        tn = cp.sum(start_below & end_below, axis=1).astype(cp.float32)  # (R,)
+                p1 = cp.where(denom_above > 0, tp / denom_above, 0.0)
+                p0v = cp.where(denom_below > 0, tn / denom_below, 0.0)
+                min_vals_all[i] = cp.minimum(p0v, p1)
 
-        # Safe division
-        p1 = cp.where(denom_above > 0, tp / denom_above, 0.0)
-        p0v = cp.where(denom_below > 0, tn / denom_below, 0.0)
-        min_vals_all[i] = cp.minimum(p0v, p1)
+    for stream in streams:
+        stream.synchronize()
 
     # AUC per rule (vectorized on CPU side using NumPy)
     x = np.asarray(cp.asnumpy(probs_cp), dtype=float)
@@ -539,107 +559,118 @@ if __name__ == "__main__":
     run_count = 5
     output_dir = Path("artifacts")
     output_dir.mkdir(parents=True, exist_ok=True)
-    sweep_stats: list[dict[str, float]] = []
+    sweep_records: list[dict[str, float | int]] = []
     for n_walkers in [100, 1000, 5000, 10000]:
-        print(f"\n\n=== Sweep with n_walkers={n_walkers} ===")
-        for number_of_rules in range(1, 11):
-            print(f"\n\n--- Sweep {number_of_rules} rules ---")
-            run_times: list[float] = []
-            run_mean_aucs: list[float] = []
-            for run_idx in range(1, run_count + 1):
-                try:
-                    rules_list = random.sample(rules, k=number_of_rules)
-                    t0 = time.perf_counter()
-                    aucs = compute_minP0P1_auc_for_rules(
-                        rule_luts=rules_list,
-                        probabilities=probabilities,
-                        n_walkers=n_walkers,
-                        k=7,
-                        lattice_size=149,
-                        n_time_steps=149 * 5,
-                    )
-                    t1 = time.perf_counter()
-                    duration = t1 - t0
-                    mean_auc = (
-                        float(np.nanmean(list(aucs.values()))) if aucs else float("nan")
-                    )
-                    run_times.append(duration)
-                    run_mean_aucs.append(mean_auc)
-                    if np.isnan(mean_auc):
-                        print(f"Run {run_idx}: total time {duration:.3f} s")
-                    else:
-                        print(
-                            f"Run {run_idx}: total time {duration:.3f} s, mean minP0P1 AUC {mean_auc:.6f}"
-                        )
-                except Exception as e:
-                    print(f"Run {run_idx} failed: {e}")
-            if not run_times:
-                print("All runs failed; skipping statistics for this sweep.")
-                continue
-            avg_time = float(np.mean(run_times))
-            std_time = float(np.std(run_times, ddof=1)) if len(run_times) > 1 else 0.0
-            avg_per_rule = avg_time / number_of_rules
-            avg_auc = float(np.nanmean(run_mean_aucs)) if run_mean_aucs else float("nan")
-            print(f"Average total time over {len(run_times)} runs: {avg_time:.3f} s")
-            print(f"Average time per rule: {avg_per_rule:.3f} s")
-            if not np.isnan(avg_auc):
-                print(f"Average minP0P1 AUC across runs: {avg_auc:.6f}")
-            sweep_stats.append({
-                "number_of_rules": number_of_rules,
-                "n_walkers": n_walkers,
-                "avg_total_time_s": avg_time,
-                "std_total_time_s": std_time,
-                "avg_time_per_rule_s": avg_per_rule,
-                "successful_runs": len(run_times),
-                "total_runs": run_count,
-            })
-
-    if sweep_stats:
-        csv_path = output_dir / "multi_rule_sweep_stats.csv"
-        with csv_path.open("w", newline="") as fh:
-            writer = csv.DictWriter(
-                fh,
-                fieldnames=[
-                    "number_of_rules",
-                    "n_walkers",
-                    "avg_total_time_s",
-                    "std_total_time_s",
-                    "avg_time_per_rule_s",
-                    "successful_runs",
-                    "total_runs",
-                ],
+        for num_streams in range(1, 6):
+            print(
+                f"\n\n=== Sweep with n_walkers={n_walkers}, num_streams={num_streams} ==="
             )
-            writer.writeheader()
-            writer.writerows(sweep_stats)
+            for number_of_rules in range(1, 11):
+                print(f"\n\n--- Sweep {number_of_rules} rules ---")
+                run_times: list[float] = []
+                run_mean_aucs: list[float] = []
+                for run_idx in range(1, run_count + 1):
+                    try:
+                        rules_list = random.sample(rules, k=number_of_rules)
+                        t0 = time.perf_counter()
+                        aucs = compute_minP0P1_auc_for_rules(
+                            rule_luts=rules_list,
+                            probabilities=probabilities,
+                            n_walkers=n_walkers,
+                            k=7,
+                            lattice_size=149,
+                            n_time_steps=149 * 5,
+                            num_streams=num_streams,
+                        )
+                        t1 = time.perf_counter()
+                        duration = t1 - t0
+                        mean_auc = (
+                            float(np.nanmean(list(aucs.values())))
+                            if aucs
+                            else float("nan")
+                        )
+                        run_times.append(duration)
+                        run_mean_aucs.append(mean_auc)
+                        if np.isnan(mean_auc):
+                            print(
+                                f"Run {run_idx}: total time {duration:.3f} s (streams={num_streams})"
+                            )
+                        else:
+                            print(
+                                "Run {idx}: total time {dur:.3f} s, mean minP0P1 AUC "
+                                "{auc:.6f} (streams={streams})".format(
+                                    idx=run_idx,
+                                    dur=duration,
+                                    auc=mean_auc,
+                                    streams=num_streams,
+                                )
+                            )
+                    except Exception as e:
+                        print(f"Run {run_idx} failed: {e}")
+                if not run_times:
+                    print("All runs failed; skipping statistics for this sweep.")
+                    continue
+                avg_time = float(np.mean(run_times))
+                std_time = (
+                    float(np.std(run_times, ddof=1)) if len(run_times) > 1 else 0.0
+                )
+                avg_per_rule = avg_time / number_of_rules
+                avg_auc = (
+                    float(np.nanmean(run_mean_aucs)) if run_mean_aucs else float("nan")
+                )
+                print(
+                    f"Average total time over {len(run_times)} runs: {avg_time:.3f} s"
+                )
+                print(f"Average time per rule: {avg_per_rule:.3f} s")
+                if not np.isnan(avg_auc):
+                    print(f"Average minP0P1 AUC across runs: {avg_auc:.6f}")
+                sweep_records.append({
+                    "number_of_rules": number_of_rules,
+                    "n_walkers": n_walkers,
+                    "num_streams": num_streams,
+                    "avg_total_time_s": avg_time,
+                    "std_total_time_s": std_time,
+                    "avg_time_per_rule_s": avg_per_rule,
+                    "successful_runs": len(run_times),
+                    "total_runs": run_count,
+                })
 
-    # loading sweep stats
-    sweep_stats = pd.read_csv(csv_path)
-    plt.figure(figsize=(8, 6))
-    sns.set(style="whitegrid")
-    df = sweep_stats.copy()
-    df["number_of_rules"] = df["number_of_rules"].astype(int)
-    df["n_walkers"] = df["n_walkers"].astype(int)
-    df["avg_time_per_rule_s"] = df["avg_time_per_rule_s"].astype(float)
+    csv_path = output_dir / "multi_rule_stream_sweep_stats.csv"
+    plot_path = output_dir / "multi_rule_stream_sweep_avg_times.png"
 
-    plt.figure(figsize=(10, 6))
-    ax = sns.lineplot(
-        data=df,
-        x="number_of_rules",
-        y="avg_time_per_rule_s",
-        hue="n_walkers",
-        marker="o",
-        palette="tab10",
-        estimator="mean",
-        ci=None,
-    )
-    ax.set_xlabel("Number of rules")
-    ax.set_ylabel("Average time per rule (s)")
-    ax.set_title("Average time per rule vs Number of rules (hue = n_walkers)")
-    ax.legend(title="n_walkers", loc="best")
-    ax.set_xticks(sorted(df["number_of_rules"].unique()))
-    plt.tight_layout()
-    plot_path = output_dir / "multi_rule_sweep_avg_times.png"
-    plt.savefig(plot_path, dpi=200)
-    plt.close()
-    print(f"Saved sweep statistics to {csv_path}")
-    print(f"Saved sweep timing plot to {plot_path}")
+    if not sweep_records:
+        print("No sweep statistics collected; skipping CSV and plot generation.")
+    else:
+        stats_df = pd.DataFrame(sweep_records)
+        stats_df.to_csv(csv_path, index=False)
+        print(f"Saved sweep statistics to {csv_path}")
+
+        sns.set(style="whitegrid")
+        stats_df["number_of_rules"] = stats_df["number_of_rules"].astype(int)
+        stats_df["n_walkers"] = stats_df["n_walkers"].astype(int)
+        stats_df["num_streams"] = stats_df["num_streams"].astype(int)
+        stats_df["avg_time_per_rule_s"] = stats_df["avg_time_per_rule_s"].astype(float)
+
+        plt.figure(figsize=(10, 6))
+        ax = sns.lineplot(
+            data=stats_df,
+            x="number_of_rules",
+            y="avg_time_per_rule_s",
+            hue="num_streams",
+            style="n_walkers",
+            markers=True,
+            palette="tab10",
+            estimator="mean",
+            ci=None,
+        )
+        ax.set_xlabel("Number of rules")
+        ax.set_ylabel("Average time per rule (s)")
+        ax.set_title(
+            "Average time per rule vs Number of rules\nHue = streams, style = walkers"
+        )
+        ax.legend(title="Streams (hue) / Walkers (style)", loc="best")
+        ax.set_xticks(sorted(stats_df["number_of_rules"].unique()))
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=200)
+        plt.close()
+        print(f"Saved sweep timing plot to {plot_path}")
