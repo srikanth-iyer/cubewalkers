@@ -1,10 +1,13 @@
+
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
 import time
 import gc
+from types import SimpleNamespace
+from typing import Sequence
+
 import cupy as cp
 import numpy as np
-import pandas as pd
 import cubewalkers as cw
 from cana.boolean_network import BooleanNetwork
 from scipy import integrate
@@ -153,13 +156,13 @@ def fitness_split(
         biases = cp.linspace(0, 1, n_walkers)
         # Initialize the states array
         initial_states = cp.random.random((lattice_size, n_walkers)) <= biases
-        # Update: ensure boolean type
         model.initial_states = initial_states.astype(cp.bool_)
     else:
         model.initialize_walkers()
 
     model.simulate_ensemble(
-        maskfunction=cw.update_schemes.synchronous_PBN, T_window=2
+        maskfunction=cw.update_schemes.synchronous_PBN,
+        T_window=2,
     )  # storing last two time-steps for convergence check. Single timestep doesn't spot alternating convergence.
     accuracies = compute_accuracy(model, noise=noise, deviations=deviations)
 
@@ -531,25 +534,327 @@ def _fitness_auc_processpool_worker(args: tuple) -> tuple[float, dict, float]:
     return noise, res, float(elapsed_ms)
 
 
+# ---------------------------------------------------------------------------
+# Multi-variant probabilistic LUT simulation (new functionality)
+
+_MULTI_VARIANT_KERNEL: cp.RawKernel | None = None
+
+
+def _get_multi_variant_kernel() -> cp.RawKernel:
+    """Compile or retrieve the cached multi-variant probabilistic LUT kernel."""
+
+    global _MULTI_VARIANT_KERNEL
+    if _MULTI_VARIANT_KERNEL is None:
+        kernel_body = r"""
+extern "C" __global__
+void multi_variant_probabilistic(
+    const bool* input_state,
+    const float* mask,
+    bool* output_state,
+    const float* lut,
+    const int* regulators,
+    const int* walker_variant,
+    int N,
+    int W,
+    int L,
+    int max_inputs)
+{
+    int w = blockDim.x * blockIdx.x + threadIdx.x;
+    int n = blockDim.y * blockIdx.y + threadIdx.y;
+    if (w >= W || n >= N) {
+        return;
+    }
+
+    int idx = n * W + w;
+    if (mask[idx] <= 0.0f) {
+        output_state[idx] = input_state[idx];
+        return;
+    }
+
+    int variant = walker_variant[w];
+    long long lut_offset = ((long long)variant * N + n) * L;
+    int lookup_index = 0;
+    int reg_offset = n * max_inputs;
+
+    for (int k = 0; k < max_inputs; ++k) {
+        int regulator = regulators[reg_offset + k];
+        if (regulator < 0) {
+            break;
+        }
+        lookup_index = (lookup_index << 1) + (int)input_state[regulator * W + w];
+    }
+
+    float threshold = lut[lut_offset + lookup_index];
+    output_state[idx] = threshold >= mask[idx];
+}
+"""
+
+        _MULTI_VARIANT_KERNEL = cp.RawKernel(
+            kernel_body,
+            "multi_variant_probabilistic",
+        )  # type: ignore[arg-type]
+    return _MULTI_VARIANT_KERNEL
+
+
+def simulate_multi_variant_probabilistic(
+    *,
+    lookup_tables_variants: cp.ndarray,
+    node_regulators: cp.ndarray,
+    N: int,
+    T: int,
+    W: int,
+    walker_variant_idx: cp.ndarray | None = None,
+    maskfunction=cw.update_schemes.synchronous_PBN,
+    T_window: int | None = None,
+    threads_per_block: tuple[int, int] = (16, 16),
+    initial_states: cp.ndarray | None = None,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Simulate an ensemble where walkers are partitioned across LUT variants.
+
+    Parameters
+    ----------
+    lookup_tables_variants : cp.ndarray
+        Array of shape (V, N, L) containing probabilistic LUTs for each variant.
+    node_regulators : cp.ndarray
+        Integer array of shape (N, max_inputs) describing regulators per node.
+    N : int
+        Number of nodes in the network.
+    T : int
+        Number of timesteps to simulate.
+    W : int
+        Total number of walkers.
+    walker_variant_idx : cp.ndarray | None, optional
+        Mapping from walker index to LUT variant. If ``None``, walkers are
+        distributed as evenly as possible across variants.
+    maskfunction : callable, optional
+        Update scheme that produces the update mask. Defaults to synchronous PBN.
+    T_window : int | None, optional
+        Number of trailing timesteps to retain. If ``None`` or invalid, all
+        timesteps are retained.
+    threads_per_block : tuple[int, int], optional
+        CUDA block shape (node_dim, walker_dim). Defaults to (16, 16).
+    initial_states : cp.ndarray | None, optional
+        Optional initial state array of shape (N, W). If ``None``, random states
+        are generated.
+
+    Returns
+    -------
+    tuple[cp.ndarray, cp.ndarray, cp.ndarray]
+        ``(trajectories, initial_states, walker_variant_idx)`` where
+        ``trajectories`` has shape (T_window, N, W).
+    """
+
+    if lookup_tables_variants.ndim != 3:
+        raise ValueError("lookup_tables_variants must have shape (variants, N, L)")
+
+    num_variants, lut_nodes, lut_length = lookup_tables_variants.shape
+    if lut_nodes != N:
+        raise ValueError("lookup_tables_variants second dimension must equal N")
+
+    max_inputs = node_regulators.shape[1]
+
+    if W <= 0:
+        raise ValueError("Number of walkers must be positive")
+
+    if walker_variant_idx is None:
+        base = W // num_variants
+        remainder = W % num_variants
+        assignments = []
+        for variant in range(num_variants):
+            count = base + (1 if variant < remainder else 0)
+            assignments.append(cp.full((count,), variant, dtype=cp.int32))
+        walker_variant_arr = cp.concatenate(assignments)
+        cp.random.shuffle(walker_variant_arr)
+    else:
+        walker_variant_arr = cp.asarray(walker_variant_idx, dtype=cp.int32)
+        if walker_variant_arr.size != W:
+            raise ValueError("walker_variant_idx must have length equal to W")
+
+    if initial_states is None:
+        init_states = (cp.random.random((N, W)) <= 0.5).astype(cp.bool_)
+    else:
+        if initial_states.shape != (N, W):
+            raise ValueError("initial_states must have shape (N, W)")
+        init_states = initial_states.astype(cp.bool_, copy=False)
+
+    kernel = _get_multi_variant_kernel()
+    tables = cp.ascontiguousarray(lookup_tables_variants.astype(cp.float32, copy=False))
+    regulators = cp.ascontiguousarray(node_regulators.astype(cp.int32, copy=False))
+    variant_map = cp.ascontiguousarray(walker_variant_arr)
+
+    tpb_nodes, tpb_walkers = threads_per_block
+    if tpb_nodes * tpb_walkers > 1024:
+        raise ValueError("threads_per_block product must not exceed 1024")
+    block = (int(tpb_walkers), int(tpb_nodes))
+    grid = (
+        (W + tpb_walkers - 1) // tpb_walkers,
+        (N + tpb_nodes - 1) // tpb_nodes,
+    )
+
+    out = init_states.copy()
+
+    if T_window is None or T_window > T or T_window < 1:
+        T_window = T + 1
+
+    trajectories = cp.empty((T_window, N, W), dtype=cp.bool_)
+    trajectories[0, :, :] = out
+
+    for t in range(T):
+        current = out.copy()
+        mask = maskfunction(
+            t,
+            N,
+            W,
+            current,
+            threads_per_block=threads_per_block,
+        ).astype(cp.float32, copy=False)
+
+        kernel(
+            grid,
+            block,
+            (
+                current,
+                mask,
+                out,
+                tables,
+                regulators,
+                variant_map,
+                np.int32(N),
+                np.int32(W),
+                np.int32(lut_length),
+                np.int32(max_inputs),
+            ),
+        )
+
+        if t >= T - T_window:
+            trajectories[t - (T - T_window), :, :] = out
+
+    return trajectories, init_states, variant_map
+
+
+def fitness_split_multi_variant(
+    rule: str,
+    noises: Sequence[float] | None = None,
+    n_walkers: int = 1000,
+    time_step_factor: int = 5,
+    lattice_size: int = 149,
+    k: int = 7,
+    initial_config_type: str = "normal",
+    threads_per_block: tuple[int, int] = (32, 32),
+    T_window: int = 2,
+) -> dict[float, dict[str, float]]:
+    """Evaluate a rule across multiple noise variants in a single simulation.
+
+    Parameters
+    ----------
+    rule : str
+        Rule string to evaluate.
+    noises : Sequence[float] | None, optional
+        Noise levels to simulate. Defaults to a ten-point sweep if omitted.
+    n_walkers : int, optional
+        Number of walkers assigned *per noise level*. The total walkers used in
+        the simulation are ``n_walkers * len(noises)``.
+    """
+
+    if noises is None:
+        noises = [
+            0.000,
+            0.010,
+            0.020,
+            0.030,
+            0.040,
+            0.050,
+            0.060,
+            0.070,
+            0.080,
+            0.090,
+            0.100,
+        ]
+
+    noises = list(noises)
+    if len(noises) == 0:
+        raise ValueError("noises must contain at least one value")
+
+    output_list = list(rule)
+    network = ca_network_from_output_list(output_list, k=k, lattice=lattice_size)
+
+    lookup_tables = []
+    node_regulators = None
+    for noise in noises:
+        outs, ins = cw.conversions.cana2cupy_probabilisticLUT(network, prob=noise)
+        lookup_tables.append(outs)
+        if node_regulators is None:
+            node_regulators = ins
+        else:
+            if not cp.all(ins == node_regulators):
+                raise ValueError("Node regulators differ across noise variants")
+
+    assert node_regulators is not None
+    lookup_tables_variants = cp.stack(lookup_tables, axis=0)
+
+    if initial_config_type not in ["normal", "uniform_bias_dist"]:
+        raise ValueError("initial_config_type must be 'normal' or 'uniform_bias_dist'")
+
+    num_variants = len(noises)
+    total_walkers = n_walkers * num_variants
+
+    if initial_config_type == "uniform_bias_dist":
+        biases = cp.linspace(0, 1, total_walkers)
+        init_states = (
+            cp.random.random((lattice_size, total_walkers)) <= biases
+        ).astype(cp.bool_)
+    else:
+        init_states = (cp.random.random((lattice_size, total_walkers)) <= 0.5).astype(
+            cp.bool_
+        )
+
+    assignments = [
+        cp.full((n_walkers,), variant, dtype=cp.int32)
+        for variant in range(num_variants)
+    ]
+    walker_variant_idx = cp.concatenate(assignments)
+    cp.random.shuffle(walker_variant_idx)
+
+    n_time_steps = lattice_size * time_step_factor + 1
+
+    trajectories, used_initial_states, variant_map = (
+        simulate_multi_variant_probabilistic(
+            lookup_tables_variants=lookup_tables_variants,
+            node_regulators=node_regulators,
+            N=lattice_size,
+            T=n_time_steps,
+            W=total_walkers,
+            walker_variant_idx=walker_variant_idx,
+            maskfunction=cw.update_schemes.synchronous_PBN,
+            T_window=T_window,
+            threads_per_block=threads_per_block,
+            initial_states=init_states,
+        )
+    )
+
+    results: dict[float, dict[str, float]] = {}
+    for variant, noise in enumerate(noises):
+        walker_ids = cp.where(variant_map == variant)[0]
+        traj_slice = trajectories[:, :, walker_ids]
+        init_slice = used_initial_states[:, walker_ids]
+        model_stub = SimpleNamespace(trajectories=traj_slice, initial_states=init_slice)
+        results[noise] = compute_accuracy(model_stub, noise=noise, deviations=3.0)
+
+    return results
+
+
 # %%
 if __name__ == "__main__":
     # noise = 0.01
-    # lattice_size = 149
-    # k = 7
-    # rule = "00000000010111110000000001011111000000000101111100000000010111110000000001011111111111110101111100000000010111111111111101011111"
-    # network = ca_network_from_output_list(rule, k=k, lattice=lattice_size)
-    # print(f"Network:{network}")
-    # outs, ins = cw.conversions.cana2cupy_probabilisticLUT(network, prob=noise)
-    # print(f"Outs.shape: {outs.shape}, ins.shape: {ins.shape}")
-    # print(f"Outs: {outs}")
-    # print(f"Ins: {ins}")
-    # model = cw.Model(
-    #     lookup_tables=outs,
-    #     node_regulators=ins,
-    #     n_time_steps=lattice_size * 5 + 1,
-    #     n_walkers=1000,
-    #     probabilistic_lut=True,
-    # )
+    lattice_size = 149
+    k = 7
+    rule = "00000000010111110000000001011111000000000101111100000000010111110000000001011111111111110101111100000000010111111111111101011111"
+    begin = time.perf_counter()
+    results = fitness_split_multi_variant(rule=rule, n_walkers=10000)
+    end = time.perf_counter()
+    print(f"Time taken: {end - begin:.3f} s")
+
+    
     # print("\n=========Sequential vs Parallel probability sweep timing=============\n")
     # try:
     #     # Use a valid LUT for k=3 (length 8)
@@ -668,43 +973,43 @@ if __name__ == "__main__":
     # except Exception as e:
     #     print(f"max_workers sweep failed: {e}")
 
-    # load sweep stats and plot using seaborn
-    print("\n========= Plotting max_workers sweep stats =========\n")
-    try:
-        import seaborn as sns
-        from matplotlib import colors as mcolors
-        import matplotlib.pyplot as plt
+    # # load sweep stats and plot using seaborn
+    # print("\n========= Plotting max_workers sweep stats =========\n")
+    # try:
+    #     import seaborn as sns
+    #     from matplotlib import colors as mcolors
+    #     import matplotlib.pyplot as plt
 
-        sweep_stats = pd.read_csv("artifacts/sweep_max_workers_stats.csv")
-        # print(sweep_stats.head())
-        sns.set_palette("tab10")
-        plt.figure(figsize=(10, 6))
-        sweep_stats["max_workers"] = pd.to_numeric(sweep_stats["max_workers"], errors="coerce").fillna(0).astype(int)
-        sweep_stats["time_per_rule"] = np.where(
-            sweep_stats["max_workers"] > 0,
-            sweep_stats["time_s"] / sweep_stats["max_workers"],
-            np.nan,
-        )
-        # Treat n_walkers as a categorical variable so seaborn uses discrete hues
-        sweep_stats["n_walkers"] = sweep_stats["n_walkers"].astype(str)
-        # Order categories numerically for a sensible legend order
-        levels = sorted(sweep_stats["n_walkers"].unique(), key=lambda v: int(v))
-        sweep_stats["n_walkers"] = pd.Categorical(sweep_stats["n_walkers"], categories=levels, ordered=True)
-        
-        sns.lineplot(
-            data=sweep_stats,
-            x="max_workers",
-            y="time_per_rule",
-            hue="n_walkers",
-            style="fitness_function",
-            markers=True,
-            dashes=True,
-        )
-        plt.title("Max Workers vs Time Taken")
-        plt.xlabel("Max Workers")
-        plt.ylabel("Time (s)")
-        plt.grid(True)
-        plt.savefig("artifacts/sweep_max_workers_plot.png")
-        plt.show()
-    except Exception as e:
-        print(f"Plotting failed: {e}")
+    #     sweep_stats = pd.read_csv("artifacts/sweep_max_workers_stats.csv")
+    #     # print(sweep_stats.head())
+    #     sns.set_palette("tab10")
+    #     plt.figure(figsize=(10, 6))
+    #     sweep_stats["max_workers"] = pd.to_numeric(sweep_stats["max_workers"], errors="coerce").fillna(0).astype(int)
+    #     sweep_stats["time_per_rule"] = np.where(
+    #         sweep_stats["max_workers"] > 0,
+    #         sweep_stats["time_s"] / sweep_stats["max_workers"],
+    #         np.nan,
+    #     )
+    #     # Treat n_walkers as a categorical variable so seaborn uses discrete hues
+    #     sweep_stats["n_walkers"] = sweep_stats["n_walkers"].astype(str)
+    #     # Order categories numerically for a sensible legend order
+    #     levels = sorted(sweep_stats["n_walkers"].unique(), key=lambda v: int(v))
+    #     sweep_stats["n_walkers"] = pd.Categorical(sweep_stats["n_walkers"], categories=levels, ordered=True)
+
+    #     sns.lineplot(
+    #         data=sweep_stats,
+    #         x="max_workers",
+    #         y="time_per_rule",
+    #         hue="n_walkers",
+    #         style="fitness_function",
+    #         markers=True,
+    #         dashes=True,
+    #     )
+    #     plt.title("Max Workers vs Time Taken")
+    #     plt.xlabel("Max Workers")
+    #     plt.ylabel("Time (s)")
+    #     plt.grid(True)
+    #     plt.savefig("artifacts/sweep_max_workers_plot.png")
+    #     plt.show()
+    # except Exception as e:
+    #     print(f"Plotting failed: {e}")
